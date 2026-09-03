@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, nnls
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -185,15 +185,21 @@ def _cgsm_g2(X):
 
 
 def fit_cgsm(t, X):
+    """Non-negative least squares: both a=1/k_r and b=1/k_d must be physically >=0.
+    Unconstrained OLS would sometimes let one go negative whenever the data doesn't
+    clearly show both a reaction-controlled AND a diffusion-controlled character (e.g.
+    a segment that's mostly one regime) -- that's not a real fit, so it used to just
+    fail outright. NNLS instead correctly reports a boundary solution (one resistance
+    near zero) as a legitimate degenerate case: 'this data doesn't need that term.'"""
     A = np.column_stack([_cgsm_g1(X), _cgsm_g2(X)])
     try:
-        coef, _, _, _ = np.linalg.lstsq(A, t, rcond=None)
-        a, b = coef
-        if a <= 0 or b <= 0:
-            return None
-        return {"kr": 1 / a, "kd": 1 / b, "_a": a, "_b": b}
+        coef, _ = nnls(A, t)
     except Exception:
         return None
+    a, b = coef
+    if a <= 1e-10 and b <= 1e-10:
+        return None
+    return {"kr": 1 / max(a, 1e-6), "kd": 1 / max(b, 1e-6), "_a": a, "_b": b}
 
 
 def invert_cgsm(p, t):
