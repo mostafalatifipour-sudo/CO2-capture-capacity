@@ -341,15 +341,22 @@ def fit_stage2_diffusion(t_arr, X_arr):
     return fit
 
 
-def find_best_split(t_arr, X_arr, fast_model="Pseudo first-order", lo=0.2, hi=0.9, step=0.02):
+def find_best_split(t_arr, X_arr, fast_model="Pseudo first-order", lo=0.15, hi=0.95, step=0.02, min_frac=0.15):
     """Search candidate transition points and keep the one minimizing total SSE across
     both stages, for a given choice of fast-stage model (diffusion stage is fixed).
     Since the point count and parameter count don't change with the split location for
-    a fixed model pair, minimizing total SSE here is equivalent to minimizing total AIC/BIC."""
+    a fixed model pair, minimizing total SSE here is equivalent to minimizing total AIC/BIC.
+
+    min_frac requires each stage to contain at least this fraction of the cycle's points,
+    so a flexible model (DEM, nth-order) can't just swallow almost the entire curve as
+    'fast stage' and call a token tail 'diffusion' -- that trivially wins on SSE/AIC
+    without describing a real two-regime mechanism."""
+    n_total = len(X_arr)
+    min_pts = max(3, int(np.ceil(min_frac * n_total)))
     best = None
     for tx in np.arange(lo, hi + 1e-9, step):
         mask1, mask2 = X_arr <= tx, X_arr > tx
-        if mask1.sum() < 3 or mask2.sum() < 3:
+        if mask1.sum() < min_pts or mask2.sum() < min_pts:
             continue
         f1 = fit_model(fast_model, t_arr[mask1], X_arr[mask1])
         f2 = fit_stage2_diffusion(t_arr[mask2], X_arr[mask2])
@@ -358,6 +365,8 @@ def find_best_split(t_arr, X_arr, fast_model="Pseudo first-order", lo=0.2, hi=0.
         total_sse = f1["sse"] + f2["sse"]
         if best is None or total_sse < best["total_sse"]:
             best = {"tx": round(float(tx), 3), "f1": f1, "f2": f2, "total_sse": total_sse}
+    if best is not None:
+        best["near_bound"] = best["tx"] <= lo + step or best["tx"] >= hi - step
     return best
 
 
@@ -993,22 +1002,29 @@ if pub_prep:
 else:
     st.info("Not enough data in this cycle to plot.")
 
-# ================================================================== STEP 11: two-stage model comparison
-st.header("11. Two-stage model comparison (all models)")
-st.caption(
-    "For a chosen cycle, tries every model as the fast/reaction-controlled stage (paired with the standard "
-    "product-layer diffusion equation for the slow stage) and reports every fitted number for each pairing. "
-    "The transition point is auto-optimized per model (minimizing total SSE across both stages), so this is a "
-    "fair, like-for-like comparison. The best-fitting row (lowest total AIC) is highlighted."
-)
+# ================================================================== STEP 11: model comparison (final)
+st.header("11. Model comparison (all models)")
 
 final_cycle = st.selectbox("Cycle", cycle_labels_all, key="final_compare_cycle")
+comparison_type = st.radio(
+    "Comparison type", ["Two-stage (fast + diffusion)", "Single-stage (whole-curve)"],
+    horizontal=True, key="final_comparison_type",
+)
 final_row = valid[valid["label"] == final_cycle].iloc[0]
 final_prep = prepare_kinetics(df, final_row, onset_pct)
 
 if final_prep is None:
     st.warning("Not enough data in this cycle.")
-else:
+elif comparison_type == "Two-stage (fast + diffusion)":
+    st.caption(
+        "Tries every model as the fast/reaction-controlled stage (paired with the standard product-layer "
+        "diffusion equation for the slow stage) and reports every fitted number for each pairing. The transition "
+        "point is auto-optimized per model (minimizing total SSE across both stages, with each stage required to "
+        "hold at least 15% of the cycle's points, so a flexible model can't just swallow the whole curve and call "
+        "a token tail 'diffusion'). The best-fitting row (lowest total AIC) is highlighted. A 'near search bound' "
+        "note means that model's optimal split landed at the edge of the search range \u2014 treat that row cautiously, "
+        "since the model wants an even more extreme split than it was allowed."
+    )
     kept = final_prep["kept"]
     t_arrF, X_arrF = kept["t_fit"].values, kept["X"].values
     final_rows = []
@@ -1019,7 +1035,7 @@ else:
                 "Fast-stage model": name, "Transition X": None, "Fast params": "fit failed",
                 "R2 fast": None, "SSE fast": None, "AIC fast": None, "BIC fast": None,
                 "Diffusion params": "\u2014", "R2 diff": None, "SSE diff": None, "AIC diff": None, "BIC diff": None,
-                "Total SSE": None, "Total AIC": None, "Total BIC": None,
+                "Total SSE": None, "Total AIC": None, "Total BIC": None, "Note": "\u2014",
             })
             continue
         f1, f2 = best["f1"], best["f2"]
@@ -1030,6 +1046,7 @@ else:
             "Diffusion params": params_str(f2["params"]), "R2 diff": f2["r2"], "SSE diff": f2["sse"],
             "AIC diff": f2["aic"], "BIC diff": f2["bic"],
             "Total SSE": tot["sse"], "Total AIC": tot["aic"], "Total BIC": tot["bic"],
+            "Note": "\u26a0 near search bound" if best.get("near_bound") else "",
         })
 
     final_df = pd.DataFrame(final_rows).sort_values("Total AIC", na_position="last").reset_index(drop=True)
@@ -1050,10 +1067,49 @@ else:
 
     if final_df["Total AIC"].notna().any():
         best_row = final_df.loc[final_df["Total AIC"].idxmin()]
+        note = " (\u26a0 landed near the search bound \u2014 interpret cautiously)" if best_row["Note"] else ""
         st.caption(
             f"**Best overall: {best_row['Fast-stage model']}** as the fast stage "
             f"(Transition X = {best_row['Transition X']:.2f}, Total AIC = {best_row['Total AIC']:.2f}, "
-            f"Total SSE = {best_row['Total SSE']:.4g})."
+            f"Total SSE = {best_row['Total SSE']:.4g}){note}."
         )
 
     df_download_buttons(final_df, f"two_stage_comparison_{final_cycle}", "final_cmp")
+
+else:
+    st.caption(
+        "Fits every model as a single continuous curve over the whole cycle (no split). R\u00b2, SSE, AIC and BIC "
+        "are all on the same X-domain scale, so they're directly comparable across models. The best-fitting row "
+        "(lowest AIC) is highlighted."
+    )
+    kept = final_prep["kept"]
+    t_arrF, X_arrF = kept["t_fit"].values, kept["X"].values
+    single_rows = []
+    for name in MODEL_NAMES:
+        fit = fit_model(name, t_arrF, X_arrF) if len(t_arrF) >= 3 else None
+        if fit is None:
+            single_rows.append({"Model": name, "Parameters": "fit failed", "R2": None, "SSE": None, "AIC": None, "BIC": None})
+            continue
+        single_rows.append({
+            "Model": name, "Parameters": params_str(fit["params"]),
+            "R2": fit["r2"], "SSE": fit["sse"], "AIC": fit["aic"], "BIC": fit["bic"],
+        })
+    single_df = pd.DataFrame(single_rows).sort_values("AIC", na_position="last").reset_index(drop=True)
+    num_cols_single = ["R2", "SSE", "AIC", "BIC"]
+
+    def _highlight_best_single(row_):
+        is_best = row_.name == single_df["AIC"].idxmin() if single_df["AIC"].notna().any() else False
+        return ["background-color: #DCE9E4" if is_best else "" for _ in row_]
+
+    styled_single = (
+        single_df.style
+        .apply(_highlight_best_single, axis=1)
+        .format({c: "{:.4g}" for c in num_cols_single}, na_rep="\u2014")
+    )
+    st.dataframe(styled_single, use_container_width=True, hide_index=True)
+
+    if single_df["AIC"].notna().any():
+        best_single = single_df.loc[single_df["AIC"].idxmin()]
+        st.caption(f"**Best overall: {best_single['Model']}** (AIC = {best_single['AIC']:.2f}, R\u00b2 = {best_single['R2']:.4f}).")
+
+    df_download_buttons(single_df, f"single_stage_comparison_{final_cycle}", "final_cmp_single")
