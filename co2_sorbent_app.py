@@ -292,6 +292,75 @@ def params_str(params):
     return ", ".join(f"{PARAM_LABELS.get(k, k)}={v:.4g}" for k, v in params.items() if not k.startswith("_"))
 
 
+# ---------------------------------------------------------------- two-stage fitting (fast + diffusion)
+def _pack_stage_fit(params, X_arr, X_pred, count_keys):
+    resid = X_arr - X_pred
+    sse = float(np.sum(resid ** 2))
+    ss_tot = np.sum((X_arr - X_arr.mean()) ** 2)
+    r2 = 1.0 if ss_tot == 0 else 1 - sse / ss_tot
+    n_pts = len(X_arr)
+    k_params = len(count_keys)
+    sse_safe = max(sse, 1e-12)
+    aic = n_pts * np.log(sse_safe / n_pts) + 2 * k_params
+    bic = n_pts * np.log(sse_safe / n_pts) + k_params * np.log(n_pts)
+    return {"params": params, "r2": r2, "sse": sse, "aic": aic, "bic": bic, "n": n_pts, "k_params": k_params}
+
+
+def fit_stage1_fast(t_arr, X_arr):
+    """Fast, reaction-controlled stage. Forced through the true origin (t=0, X=0),
+    since this stage starts at the actual reaction onset."""
+    r = linreg(t_arr, -np.log(1 - X_arr))
+    if r is None:
+        return None
+    params = {"k": r["slope"]}
+    X_pred = 1 - np.exp(-params["k"] * t_arr)
+    fit = _pack_stage_fit(params, X_arr, X_pred, ["k"])
+    fit["invert"] = lambda t: 1 - np.exp(-params["k"] * t)
+    return fit
+
+
+def fit_stage2_diffusion(t_arr, X_arr):
+    """Slow, diffusion-controlled stage. This segment does NOT start at X=0 (it picks
+    up mid-curve, at the transition conversion), so it needs its own local intercept
+    rather than being forced through the origin -- forcing it through zero was the bug
+    causing wildly negative R2 on this stage."""
+    t0 = t_arr.min()
+    t_local = t_arr - t0
+    r = linreg(t_local, diffusion_f(X_arr))
+    if r is None:
+        return None
+    params = {"k": r["slope"], "c": r["intercept"], "t0": t0}
+
+    def invert(t):
+        target = params["c"] + params["k"] * (t - params["t0"])
+        return diffusion_inv_scalar(target)
+
+    X_pred = np.array([invert(t) for t in t_arr])
+    fit = _pack_stage_fit(params, X_arr, X_pred, ["k", "c"])
+    fit["invert"] = invert
+    return fit
+
+
+def find_best_split(t_arr, X_arr, lo=0.2, hi=0.9, step=0.02):
+    """Search candidate transition points and keep the one minimizing total SSE across
+    both stages. Since both stages always use the same two sub-models regardless of
+    where the split falls, and the combined point count doesn't change, minimizing
+    total SSE here is equivalent to minimizing total AIC/BIC."""
+    best = None
+    for tx in np.arange(lo, hi + 1e-9, step):
+        mask1, mask2 = X_arr <= tx, X_arr > tx
+        if mask1.sum() < 3 or mask2.sum() < 3:
+            continue
+        f1 = fit_stage1_fast(t_arr[mask1], X_arr[mask1])
+        f2 = fit_stage2_diffusion(t_arr[mask2], X_arr[mask2])
+        if f1 is None or f2 is None:
+            continue
+        total_sse = f1["sse"] + f2["sse"]
+        if best is None or total_sse < best["total_sse"]:
+            best = {"tx": round(float(tx), 3), "f1": f1, "f2": f2, "total_sse": total_sse}
+    return best
+
+
 # ---------------------------------------------------------------- Grasa-Abanades cyclic decay model
 def _decay_curve(N, cap0, capr, kd):
     return capr + (cap0 - capr) / (1 + kd * (N - 1))
@@ -613,33 +682,62 @@ for _, row in valid.iterrows():
             else:
                 st.warning("Couldn't fit this model to this cycle \u2014 try a simpler model or a wider selection.")
         else:
-            tx = row["transition_X"]
+            auto_split = st.checkbox("Auto-find best split (minimize total SSE)", key=f"autosplit_{row.name}_{row['label']}", value=True)
+            if auto_split:
+                best = find_best_split(t_arr, X_arr)
+                if best is None:
+                    st.warning("Couldn't find a valid split point with enough points on both sides \u2014 falling back to the manual Transition X.")
+                    tx = row["transition_X"]
+                else:
+                    tx = best["tx"]
+                    st.caption(f"Auto-detected transition at X = {tx:.2f} (lowest combined SSE across both stages).")
+            else:
+                tx = row["transition_X"]
+
             mask1, mask2 = X_arr <= tx, X_arr > tx
             if mask1.sum() >= 3 and mask2.sum() >= 3:
-                f1 = fit_model("Pseudo first-order", t_arr[mask1], X_arr[mask1])
-                f2 = fit_model("Shrinking core - product-layer diffusion", t_arr[mask2], X_arr[mask2])
+                f1 = fit_stage1_fast(t_arr[mask1], X_arr[mask1])
+                f2 = fit_stage2_diffusion(t_arr[mask2], X_arr[mask2])
                 t_split = t_arr[mask2].min()
                 c1, c2 = t_curve[t_curve <= t_split], t_curve[t_curve > t_split]
                 if f1 and len(c1):
-                    y1 = np.clip([MODEL_DEFS["Pseudo first-order"]["invert"](f1["params"], t) for t in c1], 0, 1)
+                    y1 = np.clip([f1["invert"](t) for t in c1], 0, 1)
                     kin_fig.add_trace(go.Scatter(x=c1, y=y1, mode="lines", line=dict(color="#2F6F5E", width=2), name="fast stage"))
                 if f2 and len(c2):
-                    y2 = np.clip([MODEL_DEFS["Shrinking core - product-layer diffusion"]["invert"](f2["params"], t) for t in c2], 0, 1)
+                    y2 = np.clip([f2["invert"](t) for t in c2], 0, 1)
                     kin_fig.add_trace(go.Scatter(x=c2, y=y2, mode="lines", line=dict(color="#B5482F", width=2), name="diffusion stage"))
                 kin_fig.add_vline(x=t_split, line_dash="dot", line_color="#B5482F")
                 st.plotly_chart(kin_fig, use_container_width=True)
-                mc1, mc2, mc3 = st.columns(3)
-                mc1.metric("k\u2081 fast (1/time)", f"{f1['params']['k']:.4g}" if f1 else "\u2014")
-                mc2.metric("R\u00b2 fast", f"{f1['r2']:.4f}" if f1 else "\u2014")
-                mc3.metric("AIC fast", f"{f1['aic']:.2f}" if f1 else "\u2014")
-                mc4, mc5, mc6 = st.columns(3)
-                mc4.metric("k\u2082 diffusion (1/time)", f"{f2['params']['k']:.4g}" if f2 else "\u2014")
-                mc5.metric("R\u00b2 diffusion", f"{f2['r2']:.4f}" if f2 else "\u2014")
-                mc6.metric("AIC diffusion", f"{f2['aic']:.2f}" if f2 else "\u2014")
+
+                stage_table = pd.DataFrame([
+                    {"Stage": "Fast (reaction control)",
+                     "k": f"{f1['params']['k']:.4g}" if f1 else "\u2014",
+                     "R\u00b2": f"{f1['r2']:.4f}" if f1 else "\u2014",
+                     "SSE": f"{f1['sse']:.4g}" if f1 else "\u2014",
+                     "AIC": f"{f1['aic']:.2f}" if f1 else "\u2014",
+                     "BIC": f"{f1['bic']:.2f}" if f1 else "\u2014"},
+                    {"Stage": "Diffusion (product-layer control)",
+                     "k": f"{f2['params']['k']:.4g}" if f2 else "\u2014",
+                     "R\u00b2": f"{f2['r2']:.4f}" if f2 else "\u2014",
+                     "SSE": f"{f2['sse']:.4g}" if f2 else "\u2014",
+                     "AIC": f"{f2['aic']:.2f}" if f2 else "\u2014",
+                     "BIC": f"{f2['bic']:.2f}" if f2 else "\u2014"},
+                ])
+                st.dataframe(stage_table, use_container_width=True, hide_index=True)
+                if f1 and f2:
+                    total_sse = f1["sse"] + f2["sse"]
+                    total_n = f1["n"] + f2["n"]
+                    total_k = f1["k_params"] + f2["k_params"]
+                    total_aic = total_n * np.log(max(total_sse, 1e-12) / total_n) + 2 * total_k
+                    total_bic = total_n * np.log(max(total_sse, 1e-12) / total_n) + total_k * np.log(total_n)
+                    tc1, tc2, tc3 = st.columns(3)
+                    tc1.metric("Total SSE", f"{total_sse:.4g}")
+                    tc2.metric("Total AIC", f"{total_aic:.2f}")
+                    tc3.metric("Total BIC", f"{total_bic:.2f}")
                 st.caption(
-                    f"Fast stage: *{MODEL_DEFS['Pseudo first-order']['eq']}*. "
-                    f"Diffusion stage: *{MODEL_DEFS['Shrinking core - product-layer diffusion']['eq']}*, "
-                    f"split at X = {tx:.2f}."
+                    f"Fast stage: *-ln(1-X) = k\u00b7t* (forced through the true reaction origin). "
+                    f"Diffusion stage: *1-(2/3)X-(1-X)^(2/3) = k\u00b7t + c* (own local intercept, since this "
+                    f"segment doesn't start at X=0), split at X = {tx:.2f}."
                 )
             else:
                 st.warning("Not enough points on one side of the transition to fit both stages.")
@@ -765,16 +863,21 @@ for _, row in valid.iterrows():
             rec.update({"R2": fit["r2"], "SSE": fit["sse"], "AIC": fit["aic"], "BIC": fit["bic"]})
         summary_rows.append(rec)
     else:
-        tx = row["transition_X"]
+        auto_split = st.session_state.get(f"autosplit_{row.name}_{row['label']}", True)
+        if auto_split:
+            best = find_best_split(t_arr, X_arr)
+            tx = best["tx"] if best else row["transition_X"]
+        else:
+            tx = row["transition_X"]
         mask1, mask2 = X_arr <= tx, X_arr > tx
-        rec = {"Cycle": row["label"], "Model": "Two-stage (first-order + diffusion)", "Temperature": row.get("temperature")}
+        rec = {"Cycle": row["label"], "Model": "Two-stage (first-order + diffusion)", "Temperature": row.get("temperature"), "Transition X": tx}
         if mask1.sum() >= 3 and mask2.sum() >= 3:
-            f1 = fit_model("Pseudo first-order", t_arr[mask1], X_arr[mask1])
-            f2 = fit_model("Shrinking core - product-layer diffusion", t_arr[mask2], X_arr[mask2])
+            f1 = fit_stage1_fast(t_arr[mask1], X_arr[mask1])
+            f2 = fit_stage2_diffusion(t_arr[mask2], X_arr[mask2])
             if f1:
                 rec.update({"k1": f1["params"]["k"], "R2_fast": f1["r2"], "AIC_fast": f1["aic"], "BIC_fast": f1["bic"], "SSE_fast": f1["sse"]})
             if f2:
-                rec.update({"k2": f2["params"]["k"], "R2_diff": f2["r2"], "AIC_diff": f2["aic"], "BIC_diff": f2["bic"], "SSE_diff": f2["sse"]})
+                rec.update({"k2": f2["params"]["k"], "c2": f2["params"]["c"], "R2_diff": f2["r2"], "AIC_diff": f2["aic"], "BIC_diff": f2["bic"], "SSE_diff": f2["sse"]})
         summary_rows.append(rec)
 
 summary_df = pd.DataFrame(summary_rows)
