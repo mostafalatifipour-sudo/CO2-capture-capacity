@@ -341,17 +341,17 @@ def fit_stage2_diffusion(t_arr, X_arr):
     return fit
 
 
-def find_best_split(t_arr, X_arr, lo=0.2, hi=0.9, step=0.02):
+def find_best_split(t_arr, X_arr, fast_model="Pseudo first-order", lo=0.2, hi=0.9, step=0.02):
     """Search candidate transition points and keep the one minimizing total SSE across
-    both stages. Since both stages always use the same two sub-models regardless of
-    where the split falls, and the combined point count doesn't change, minimizing
-    total SSE here is equivalent to minimizing total AIC/BIC."""
+    both stages, for a given choice of fast-stage model (diffusion stage is fixed).
+    Since the point count and parameter count don't change with the split location for
+    a fixed model pair, minimizing total SSE here is equivalent to minimizing total AIC/BIC."""
     best = None
     for tx in np.arange(lo, hi + 1e-9, step):
         mask1, mask2 = X_arr <= tx, X_arr > tx
         if mask1.sum() < 3 or mask2.sum() < 3:
             continue
-        f1 = fit_stage1_fast(t_arr[mask1], X_arr[mask1])
+        f1 = fit_model(fast_model, t_arr[mask1], X_arr[mask1])
         f2 = fit_stage2_diffusion(t_arr[mask2], X_arr[mask2])
         if f1 is None or f2 is None:
             continue
@@ -359,6 +359,16 @@ def find_best_split(t_arr, X_arr, lo=0.2, hi=0.9, step=0.02):
         if best is None or total_sse < best["total_sse"]:
             best = {"tx": round(float(tx), 3), "f1": f1, "f2": f2, "total_sse": total_sse}
     return best
+
+
+def total_stats(f1, f2):
+    total_sse = f1["sse"] + f2["sse"]
+    total_n = f1["n"] + f2["n"]
+    total_k = f1["k_params"] + f2["k_params"]
+    sse_safe = max(total_sse, 1e-12)
+    total_aic = total_n * np.log(sse_safe / total_n) + 2 * total_k
+    total_bic = total_n * np.log(sse_safe / total_n) + total_k * np.log(total_n)
+    return {"sse": total_sse, "aic": total_aic, "bic": total_bic}
 
 
 # ---------------------------------------------------------------- Grasa-Abanades cyclic decay model
@@ -633,114 +643,144 @@ for _, row in valid.iterrows():
 
         st.caption(f"Onset detected at t = {t_onset:.3f} (selection-relative) \u2014 {len(excluded)} point(s) excluded as dead time.")
         compare_mode = st.checkbox("Compare all models", key=f"compare_{row.name}_{row['label']}")
+        fast_model = row["model"]
 
-        if compare_mode:
-            palette = ["#2F6F5E", "#B5482F", "#4A6FA5", "#B08A2E", "#7A4E9E", "#3C8C8C", "#8E6C3A", "#6B7B4F"]
-            results_list = []
-            for i, name in enumerate(MODEL_NAMES):
-                fit = fit_model(name, t_arr, X_arr) if len(t_arr) >= 3 else None
+        if not row["two_stage"]:
+            # ---------------- single continuous-curve fit (or comparison across all 8) ----------------
+            if compare_mode:
+                palette = ["#2F6F5E", "#B5482F", "#4A6FA5", "#B08A2E", "#7A4E9E", "#3C8C8C", "#8E6C3A", "#6B7B4F"]
+                results_list = []
+                for i, name in enumerate(MODEL_NAMES):
+                    fit = fit_model(name, t_arr, X_arr) if len(t_arr) >= 3 else None
+                    if fit:
+                        d = MODEL_DEFS[name]
+                        y_curve = np.clip([d["invert"](fit["params"], t) for t in t_curve], 0, 1)
+                        kin_fig.add_trace(go.Scatter(x=t_curve, y=y_curve, mode="lines",
+                                                      line=dict(color=palette[i % len(palette)], width=2), name=name))
+                        results_list.append((name, fit["r2"], fit["sse"], fit["aic"], fit["bic"], params_str(fit["params"])))
+                    else:
+                        results_list.append((name, None, None, None, None, "fit failed"))
+                st.plotly_chart(kin_fig, use_container_width=True)
+                results_list.sort(key=lambda r: (r[3] is None, r[3] if r[3] is not None else 0))
+                comp_df = pd.DataFrame([
+                    {"Model": n, "R\u00b2": (f"{r2:.4f}" if r2 is not None else "\u2014"),
+                     "SSE": (f"{sse:.4g}" if sse is not None else "\u2014"),
+                     "AIC": (f"{aic:.2f}" if aic is not None else "\u2014"),
+                     "BIC": (f"{bic:.2f}" if bic is not None else "\u2014"),
+                     "Parameters": p}
+                    for n, r2, sse, aic, bic, p in results_list
+                ])
+                st.dataframe(comp_df, use_container_width=True, hide_index=True)
+                best = results_list[0]
+                if best[3] is not None:
+                    st.caption(f"Lowest AIC (best-fitting model for its complexity): **{best[0]}** (AIC = {best[3]:.2f}, R\u00b2 = {best[1]:.4f}).")
+            else:
+                fit = fit_model(fast_model, t_arr, X_arr) if len(t_arr) >= 3 else None
                 if fit:
-                    d = MODEL_DEFS[name]
+                    d = MODEL_DEFS[fast_model]
                     y_curve = np.clip([d["invert"](fit["params"], t) for t in t_curve], 0, 1)
                     kin_fig.add_trace(go.Scatter(x=t_curve, y=y_curve, mode="lines",
-                                                  line=dict(color=palette[i % len(palette)], width=2), name=name))
-                    results_list.append((name, fit["r2"], fit["sse"], fit["aic"], fit["bic"], params_str(fit["params"])))
+                                                  line=dict(color="#2F6F5E", width=2), name="fit"))
+                    st.plotly_chart(kin_fig, use_container_width=True)
+                    display_params = {k: v for k, v in fit["params"].items() if not k.startswith("_")}
+                    metric_cols = st.columns(len(display_params) + 4)
+                    for i, (key, val) in enumerate(display_params.items()):
+                        metric_cols[i].metric(PARAM_LABELS.get(key, key), f"{val:.4g}")
+                    base = len(display_params)
+                    metric_cols[base].metric("R\u00b2", f"{fit['r2']:.4f}")
+                    metric_cols[base + 1].metric("SSE", f"{fit['sse']:.4g}")
+                    metric_cols[base + 2].metric("AIC", f"{fit['aic']:.2f}")
+                    metric_cols[base + 3].metric("BIC", f"{fit['bic']:.2f}")
+                    st.caption(f"*{d['eq']}*")
                 else:
-                    results_list.append((name, None, None, None, None, "fit failed"))
-            st.plotly_chart(kin_fig, use_container_width=True)
-            results_list.sort(key=lambda r: (r[3] is None, r[3] if r[3] is not None else 0))
-            comp_df = pd.DataFrame([
-                {"Model": n, "R\u00b2": (f"{r2:.4f}" if r2 is not None else "\u2014"),
-                 "SSE": (f"{sse:.4g}" if sse is not None else "\u2014"),
-                 "AIC": (f"{aic:.2f}" if aic is not None else "\u2014"),
-                 "BIC": (f"{bic:.2f}" if bic is not None else "\u2014"),
-                 "Parameters": p}
-                for n, r2, sse, aic, bic, p in results_list
-            ])
-            st.dataframe(comp_df, use_container_width=True, hide_index=True)
-            best = results_list[0]
-            if best[3] is not None:
-                st.caption(f"Lowest AIC (best-fitting model for its complexity): **{best[0]}** (AIC = {best[3]:.2f}, R\u00b2 = {best[1]:.4f}).")
-        elif not row["two_stage"]:
-            fit = fit_model(row["model"], t_arr, X_arr) if len(t_arr) >= 3 else None
-            if fit:
-                d = MODEL_DEFS[row["model"]]
-                y_curve = np.clip([d["invert"](fit["params"], t) for t in t_curve], 0, 1)
-                kin_fig.add_trace(go.Scatter(x=t_curve, y=y_curve, mode="lines",
-                                              line=dict(color="#2F6F5E", width=2), name="fit"))
-                st.plotly_chart(kin_fig, use_container_width=True)
-                display_params = {k: v for k, v in fit["params"].items() if not k.startswith("_")}
-                metric_cols = st.columns(len(display_params) + 4)
-                for i, (key, val) in enumerate(display_params.items()):
-                    metric_cols[i].metric(PARAM_LABELS.get(key, key), f"{val:.4g}")
-                base = len(display_params)
-                metric_cols[base].metric("R\u00b2", f"{fit['r2']:.4f}")
-                metric_cols[base + 1].metric("SSE", f"{fit['sse']:.4g}")
-                metric_cols[base + 2].metric("AIC", f"{fit['aic']:.2f}")
-                metric_cols[base + 3].metric("BIC", f"{fit['bic']:.2f}")
-                st.caption(f"*{d['eq']}*")
-            else:
-                st.warning("Couldn't fit this model to this cycle \u2014 try a simpler model or a wider selection.")
+                    st.warning("Couldn't fit this model to this cycle \u2014 try a simpler model or a wider selection.")
         else:
+            # ---------------- two-stage fit: 'model' column picks the fast-stage sub-model ----------------
             auto_split = st.checkbox("Auto-find best split (minimize total SSE)", key=f"autosplit_{row.name}_{row['label']}", value=True)
-            if auto_split:
-                best = find_best_split(t_arr, X_arr)
-                if best is None:
-                    st.warning("Couldn't find a valid split point with enough points on both sides \u2014 falling back to the manual Transition X.")
-                    tx = row["transition_X"]
+
+            if compare_mode:
+                palette = ["#2F6F5E", "#B5482F", "#4A6FA5", "#B08A2E", "#7A4E9E", "#3C8C8C", "#8E6C3A", "#6B7B4F"]
+                rows_cmp = []
+                for i, name in enumerate(MODEL_NAMES):
+                    if auto_split:
+                        best_i = find_best_split(t_arr, X_arr, fast_model=name)
+                        tx_i, f1i, f2i = (best_i["tx"], best_i["f1"], best_i["f2"]) if best_i else (row["transition_X"], None, None)
+                    else:
+                        tx_i = row["transition_X"]
+                        m1, m2 = X_arr <= tx_i, X_arr > tx_i
+                        f1i = fit_model(name, t_arr[m1], X_arr[m1]) if m1.sum() >= 3 else None
+                        f2i = fit_stage2_diffusion(t_arr[m2], X_arr[m2]) if m2.sum() >= 3 else None
+                    if f1i is None or f2i is None:
+                        rows_cmp.append({"Fast-stage model": name, "Transition X": f"{tx_i:.2f}", "Fast params": "\u2014",
+                                          "R\u00b2 fast": "\u2014", "k\u2082 diff": "\u2014", "R\u00b2 diff": "\u2014",
+                                          "Total SSE": None, "Total AIC": None, "Total BIC": None})
+                        continue
+                    tot = total_stats(f1i, f2i)
+                    rows_cmp.append({"Fast-stage model": name, "Transition X": f"{tx_i:.2f}",
+                                      "Fast params": params_str(f1i["params"]), "R\u00b2 fast": f"{f1i['r2']:.4f}",
+                                      "k\u2082 diff": f"{f2i['params']['k']:.4g}", "R\u00b2 diff": f"{f2i['r2']:.4f}",
+                                      "Total SSE": tot["sse"], "Total AIC": tot["aic"], "Total BIC": tot["bic"]})
+                cmp2_df = pd.DataFrame(rows_cmp).sort_values("Total AIC", na_position="last")
+                display_df = cmp2_df.copy()
+                for c in ["Total SSE", "Total AIC", "Total BIC"]:
+                    display_df[c] = display_df[c].map(lambda v: f"{v:.4g}" if pd.notna(v) else "\u2014")
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+                valid_rows = cmp2_df.dropna(subset=["Total AIC"])
+                if len(valid_rows):
+                    best_row = valid_rows.iloc[0]
+                    st.caption(f"Lowest total AIC: **{best_row['Fast-stage model']}** as the fast stage "
+                               f"(Total AIC = {best_row['Total AIC']:.2f}).")
+            else:
+                if auto_split:
+                    best = find_best_split(t_arr, X_arr, fast_model=fast_model)
+                    if best is None:
+                        st.warning("Couldn't find a valid split point with enough points on both sides \u2014 falling back to the manual Transition X.")
+                        tx = row["transition_X"]
+                        mask1, mask2 = X_arr <= tx, X_arr > tx
+                        f1 = fit_model(fast_model, t_arr[mask1], X_arr[mask1]) if mask1.sum() >= 3 else None
+                        f2 = fit_stage2_diffusion(t_arr[mask2], X_arr[mask2]) if mask2.sum() >= 3 else None
+                    else:
+                        tx, f1, f2 = best["tx"], best["f1"], best["f2"]
+                        st.caption(f"Auto-detected transition at X = {tx:.2f} (fast stage = {fast_model}, lowest combined SSE).")
                 else:
-                    tx = best["tx"]
-                    st.caption(f"Auto-detected transition at X = {tx:.2f} (lowest combined SSE across both stages).")
-            else:
-                tx = row["transition_X"]
+                    tx = row["transition_X"]
+                    mask1, mask2 = X_arr <= tx, X_arr > tx
+                    f1 = fit_model(fast_model, t_arr[mask1], X_arr[mask1]) if mask1.sum() >= 3 else None
+                    f2 = fit_stage2_diffusion(t_arr[mask2], X_arr[mask2]) if mask2.sum() >= 3 else None
 
-            mask1, mask2 = X_arr <= tx, X_arr > tx
-            if mask1.sum() >= 3 and mask2.sum() >= 3:
-                f1 = fit_stage1_fast(t_arr[mask1], X_arr[mask1])
-                f2 = fit_stage2_diffusion(t_arr[mask2], X_arr[mask2])
-                t_split = t_arr[mask2].min()
-                c1, c2 = t_curve[t_curve <= t_split], t_curve[t_curve > t_split]
-                if f1 and len(c1):
-                    y1 = np.clip([f1["invert"](t) for t in c1], 0, 1)
-                    kin_fig.add_trace(go.Scatter(x=c1, y=y1, mode="lines", line=dict(color="#2F6F5E", width=2), name="fast stage"))
-                if f2 and len(c2):
-                    y2 = np.clip([f2["invert"](t) for t in c2], 0, 1)
-                    kin_fig.add_trace(go.Scatter(x=c2, y=y2, mode="lines", line=dict(color="#B5482F", width=2), name="diffusion stage"))
-                kin_fig.add_vline(x=t_split, line_dash="dot", line_color="#B5482F")
-                st.plotly_chart(kin_fig, use_container_width=True)
-
-                stage_table = pd.DataFrame([
-                    {"Stage": "Fast (reaction control)",
-                     "k": f"{f1['params']['k']:.4g}" if f1 else "\u2014",
-                     "R\u00b2": f"{f1['r2']:.4f}" if f1 else "\u2014",
-                     "SSE": f"{f1['sse']:.4g}" if f1 else "\u2014",
-                     "AIC": f"{f1['aic']:.2f}" if f1 else "\u2014",
-                     "BIC": f"{f1['bic']:.2f}" if f1 else "\u2014"},
-                    {"Stage": "Diffusion (product-layer control)",
-                     "k": f"{f2['params']['k']:.4g}" if f2 else "\u2014",
-                     "R\u00b2": f"{f2['r2']:.4f}" if f2 else "\u2014",
-                     "SSE": f"{f2['sse']:.4g}" if f2 else "\u2014",
-                     "AIC": f"{f2['aic']:.2f}" if f2 else "\u2014",
-                     "BIC": f"{f2['bic']:.2f}" if f2 else "\u2014"},
-                ])
-                st.dataframe(stage_table, use_container_width=True, hide_index=True)
                 if f1 and f2:
-                    total_sse = f1["sse"] + f2["sse"]
-                    total_n = f1["n"] + f2["n"]
-                    total_k = f1["k_params"] + f2["k_params"]
-                    total_aic = total_n * np.log(max(total_sse, 1e-12) / total_n) + 2 * total_k
-                    total_bic = total_n * np.log(max(total_sse, 1e-12) / total_n) + total_k * np.log(total_n)
+                    mask1, mask2 = X_arr <= tx, X_arr > tx
+                    t_split = t_arr[mask2].min()
+                    c1, c2 = t_curve[t_curve <= t_split], t_curve[t_curve > t_split]
+                    d_fast = MODEL_DEFS[fast_model]
+                    if len(c1):
+                        y1 = np.clip([d_fast["invert"](f1["params"], t) for t in c1], 0, 1)
+                        kin_fig.add_trace(go.Scatter(x=c1, y=y1, mode="lines", line=dict(color="#2F6F5E", width=2), name="fast stage"))
+                    if len(c2):
+                        y2 = np.clip([f2["invert"](t) for t in c2], 0, 1)
+                        kin_fig.add_trace(go.Scatter(x=c2, y=y2, mode="lines", line=dict(color="#B5482F", width=2), name="diffusion stage"))
+                    kin_fig.add_vline(x=t_split, line_dash="dot", line_color="#B5482F")
+                    st.plotly_chart(kin_fig, use_container_width=True)
+
+                    stage_table = pd.DataFrame([
+                        {"Stage": f"Fast ({fast_model})", "Parameters": params_str(f1["params"]),
+                         "R\u00b2": f"{f1['r2']:.4f}", "SSE": f"{f1['sse']:.4g}", "AIC": f"{f1['aic']:.2f}", "BIC": f"{f1['bic']:.2f}"},
+                        {"Stage": "Diffusion (product-layer control)", "Parameters": params_str(f2["params"]),
+                         "R\u00b2": f"{f2['r2']:.4f}", "SSE": f"{f2['sse']:.4g}", "AIC": f"{f2['aic']:.2f}", "BIC": f"{f2['bic']:.2f}"},
+                    ])
+                    st.dataframe(stage_table, use_container_width=True, hide_index=True)
+                    tot = total_stats(f1, f2)
                     tc1, tc2, tc3 = st.columns(3)
-                    tc1.metric("Total SSE", f"{total_sse:.4g}")
-                    tc2.metric("Total AIC", f"{total_aic:.2f}")
-                    tc3.metric("Total BIC", f"{total_bic:.2f}")
-                st.caption(
-                    f"Fast stage: *-ln(1-X) = k\u00b7t* (forced through the true reaction origin). "
-                    f"Diffusion stage: *1-(2/3)X-(1-X)^(2/3) = k\u00b7t + c* (own local intercept, since this "
-                    f"segment doesn't start at X=0), split at X = {tx:.2f}."
-                )
-            else:
-                st.warning("Not enough points on one side of the transition to fit both stages.")
+                    tc1.metric("Total SSE", f"{tot['sse']:.4g}")
+                    tc2.metric("Total AIC", f"{tot['aic']:.2f}")
+                    tc3.metric("Total BIC", f"{tot['bic']:.2f}")
+                    st.caption(
+                        f"Fast stage: *{d_fast['eq']}*. "
+                        f"Diffusion stage: *1-(2/3)X-(1-X)^(2/3) = k\u00b7t + c* (own local intercept), "
+                        f"split at X = {tx:.2f}."
+                    )
+                else:
+                    st.warning("Not enough points on one side of the transition to fit both stages.")
 
 # ================================================================== STEP 7: compare cycles
 st.header("7. Compare cycles")
@@ -863,19 +903,23 @@ for _, row in valid.iterrows():
             rec.update({"R2": fit["r2"], "SSE": fit["sse"], "AIC": fit["aic"], "BIC": fit["bic"]})
         summary_rows.append(rec)
     else:
+        fast_model = row["model"]
         auto_split = st.session_state.get(f"autosplit_{row.name}_{row['label']}", True)
         if auto_split:
-            best = find_best_split(t_arr, X_arr)
+            best = find_best_split(t_arr, X_arr, fast_model=fast_model)
             tx = best["tx"] if best else row["transition_X"]
         else:
             tx = row["transition_X"]
         mask1, mask2 = X_arr <= tx, X_arr > tx
-        rec = {"Cycle": row["label"], "Model": "Two-stage (first-order + diffusion)", "Temperature": row.get("temperature"), "Transition X": tx}
+        rec = {"Cycle": row["label"], "Model": f"Two-stage ({fast_model} + diffusion)", "Temperature": row.get("temperature"), "Transition X": tx}
         if mask1.sum() >= 3 and mask2.sum() >= 3:
-            f1 = fit_stage1_fast(t_arr[mask1], X_arr[mask1])
+            f1 = fit_model(fast_model, t_arr[mask1], X_arr[mask1])
             f2 = fit_stage2_diffusion(t_arr[mask2], X_arr[mask2])
             if f1:
-                rec.update({"k1": f1["params"]["k"], "R2_fast": f1["r2"], "AIC_fast": f1["aic"], "BIC_fast": f1["bic"], "SSE_fast": f1["sse"]})
+                for k, v in f1["params"].items():
+                    if not k.startswith("_"):
+                        rec[f"fast_{PARAM_LABELS.get(k, k)}"] = v
+                rec.update({"R2_fast": f1["r2"], "AIC_fast": f1["aic"], "BIC_fast": f1["bic"], "SSE_fast": f1["sse"]})
             if f2:
                 rec.update({"k2": f2["params"]["k"], "c2": f2["params"]["c"], "R2_diff": f2["r2"], "AIC_diff": f2["aic"], "BIC_diff": f2["bic"], "SSE_diff": f2["sse"]})
         summary_rows.append(rec)
@@ -948,3 +992,68 @@ if pub_prep:
     fig_download_buttons(fig3, f"kinetics_{pub_cycle}", "fig3")
 else:
     st.info("Not enough data in this cycle to plot.")
+
+# ================================================================== STEP 11: two-stage model comparison
+st.header("11. Two-stage model comparison (all models)")
+st.caption(
+    "For a chosen cycle, tries every model as the fast/reaction-controlled stage (paired with the standard "
+    "product-layer diffusion equation for the slow stage) and reports every fitted number for each pairing. "
+    "The transition point is auto-optimized per model (minimizing total SSE across both stages), so this is a "
+    "fair, like-for-like comparison. The best-fitting row (lowest total AIC) is highlighted."
+)
+
+final_cycle = st.selectbox("Cycle", cycle_labels_all, key="final_compare_cycle")
+final_row = valid[valid["label"] == final_cycle].iloc[0]
+final_prep = prepare_kinetics(df, final_row, onset_pct)
+
+if final_prep is None:
+    st.warning("Not enough data in this cycle.")
+else:
+    kept = final_prep["kept"]
+    t_arrF, X_arrF = kept["t_fit"].values, kept["X"].values
+    final_rows = []
+    for name in MODEL_NAMES:
+        best = find_best_split(t_arrF, X_arrF, fast_model=name)
+        if best is None:
+            final_rows.append({
+                "Fast-stage model": name, "Transition X": None, "Fast params": "fit failed",
+                "R2 fast": None, "SSE fast": None, "AIC fast": None, "BIC fast": None,
+                "Diffusion params": "\u2014", "R2 diff": None, "SSE diff": None, "AIC diff": None, "BIC diff": None,
+                "Total SSE": None, "Total AIC": None, "Total BIC": None,
+            })
+            continue
+        f1, f2 = best["f1"], best["f2"]
+        tot = total_stats(f1, f2)
+        final_rows.append({
+            "Fast-stage model": name, "Transition X": best["tx"], "Fast params": params_str(f1["params"]),
+            "R2 fast": f1["r2"], "SSE fast": f1["sse"], "AIC fast": f1["aic"], "BIC fast": f1["bic"],
+            "Diffusion params": params_str(f2["params"]), "R2 diff": f2["r2"], "SSE diff": f2["sse"],
+            "AIC diff": f2["aic"], "BIC diff": f2["bic"],
+            "Total SSE": tot["sse"], "Total AIC": tot["aic"], "Total BIC": tot["bic"],
+        })
+
+    final_df = pd.DataFrame(final_rows).sort_values("Total AIC", na_position="last").reset_index(drop=True)
+
+    numeric_cols = ["Transition X", "R2 fast", "SSE fast", "AIC fast", "BIC fast",
+                     "R2 diff", "SSE diff", "AIC diff", "BIC diff", "Total SSE", "Total AIC", "Total BIC"]
+
+    def _highlight_best(row_):
+        is_best = row_.name == final_df["Total AIC"].idxmin() if final_df["Total AIC"].notna().any() else False
+        return ["background-color: #DCE9E4" if is_best else "" for _ in row_]
+
+    styled = (
+        final_df.style
+        .apply(_highlight_best, axis=1)
+        .format({c: "{:.4g}" for c in numeric_cols}, na_rep="\u2014")
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    if final_df["Total AIC"].notna().any():
+        best_row = final_df.loc[final_df["Total AIC"].idxmin()]
+        st.caption(
+            f"**Best overall: {best_row['Fast-stage model']}** as the fast stage "
+            f"(Transition X = {best_row['Transition X']:.2f}, Total AIC = {best_row['Total AIC']:.2f}, "
+            f"Total SSE = {best_row['Total SSE']:.4g})."
+        )
+
+    df_download_buttons(final_df, f"two_stage_comparison_{final_cycle}", "final_cmp")
