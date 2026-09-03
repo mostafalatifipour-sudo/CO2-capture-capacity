@@ -427,6 +427,14 @@ st.caption(
     "nth-order) need more data points in the window to fit reliably."
 )
 
+onset_pct = st.slider(
+    "Ignore pre-reaction dead time: ", 0.0, 15.0, 2.0, 0.5,
+    help="If your drag-selection starts a bit early (while the sample is still stable, before CO2 exposure), "
+         "the flat lead-in throws off the fit. This trims any points before conversion crosses the given "
+         "percentage, and resets t=0 to that point, for every cycle below.",
+    format="%.1f%%",
+) / 100.0
+
 for _, row in valid.iterrows():
     with st.expander(f"{row['label']}  \u2014  {row['model']}" + ("  (two-stage)" if row["two_stage"] else "")):
         window = df[(df["t"] >= row["t_start"]) & (df["t"] <= row["t_end"])].copy()
@@ -438,12 +446,27 @@ for _, row in valid.iterrows():
         window["X"] = ((window["w"] - row["initial_mass"]) / span).clip(0.0005, 0.999)
         window = window[window["t_rel"] > 0]
 
-        t_arr, X_arr = window["t_rel"].values, window["X"].values
+        onset_mask = window["X"] >= onset_pct
+        if onset_mask.sum() < 3:
+            st.warning("Conversion never rises above the dead-time threshold in this selection \u2014 "
+                       "lower the threshold above, or check your selection actually covers the carbonation stage.")
+            continue
+        t_onset = window.loc[onset_mask, "t_rel"].iloc[0]
+        excluded = window[window["t_rel"] < t_onset]
+        kept = window[window["t_rel"] >= t_onset].copy()
+        kept["t_fit"] = kept["t_rel"] - t_onset
+
+        t_arr, X_arr = kept["t_fit"].values, kept["X"].values
         kin_fig = go.Figure()
+        if len(excluded):
+            kin_fig.add_trace(go.Scatter(x=excluded["t_rel"] - t_onset, y=excluded["X"], mode="markers",
+                                          marker=dict(color="#B8BDB9", size=5), name="excluded (dead time)"))
         kin_fig.add_trace(go.Scatter(x=t_arr, y=X_arr, mode="markers",
-                                      marker=dict(color="#5B665F", opacity=0.5), name="data"))
+                                      marker=dict(color="#5B665F", opacity=0.6), name="data used in fit"))
+        kin_fig.add_vline(x=0, line_dash="dot", line_color="#5B665F")
         t_curve = np.linspace(t_arr.min(), t_arr.max(), 60) if len(t_arr) else np.array([])
 
+        st.caption(f"Onset detected at t = {t_onset:.3f} (selection-relative) \u2014 {len(excluded)} point(s) excluded as dead time.")
         compare_mode = st.checkbox("Compare all models", key=f"compare_{row.name}_{row['label']}")
 
         if compare_mode:
