@@ -101,11 +101,11 @@ def diffusion_inv_scalar(y):
 
 def fit_pfo(t, X):
     r = linreg(t, -np.log(1 - X))
-    return None if r is None else {"k": r["slope"]}
+    return None if r is None else {"k": r["slope"], "c": r["intercept"]}
 
 
 def invert_pfo(p, t):
-    return 1 - np.exp(-p["k"] * t)
+    return 1 - np.exp(-(p["k"] * t + p.get("c", 0.0)))
 
 
 def fit_avrami(t, X):
@@ -119,21 +119,21 @@ def invert_avrami(p, t):
 
 def fit_scm_r(t, X):
     r = linreg(t, 1 - (1 - X) ** (1 / 3))
-    return None if r is None else {"k": r["slope"]}
+    return None if r is None else {"k": r["slope"], "c": r["intercept"]}
 
 
 def invert_scm_r(p, t):
-    y = min(p["k"] * t, 1)
+    y = min(p["k"] * t + p.get("c", 0.0), 1)
     return 1 - (1 - y) ** 3
 
 
 def fit_scm_d(t, X):
     r = linreg(t, diffusion_f(X))
-    return None if r is None else {"k": r["slope"]}
+    return None if r is None else {"k": r["slope"], "c": r["intercept"]}
 
 
 def invert_scm_d(p, t):
-    return diffusion_inv_scalar(p["k"] * t)
+    return diffusion_inv_scalar(p["k"] * t + p.get("c", 0.0))
 
 
 # ---------------------------------------------------------------- model 5: Random Pore Model
