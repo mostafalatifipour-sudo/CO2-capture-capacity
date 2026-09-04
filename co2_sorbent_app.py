@@ -42,6 +42,7 @@ def model_nth_order(t, k, n):
 def evaluate_two_stage(t, X, model_func, bounds_func, p0_func):
     best_rss = float('inf')
     best_results = None
+    
     n_pts = len(t)
     if n_pts < 10:
         return None
@@ -67,25 +68,38 @@ def evaluate_two_stage(t, X, model_func, bounds_func, p0_func):
             if rss < best_rss:
                 best_rss = rss
                 best_results = {
-                    't_tr': t[idx], 'X_tr': X[idx], 'idx_tr': idx,
-                    'popt1': popt1, 'popt2': popt2, 'y_pred': total_pred, 'rss': rss
+                    't_tr': t[idx],
+                    'X_tr': X[idx],
+                    'idx_tr': idx,
+                    'popt1': popt1,
+                    'popt2': popt2,
+                    'y_pred': total_pred,
+                    'rss': rss
                 }
         except:
             continue
             
     return best_results
 
+# -----------------------------------------------------------------------------
+# 2. STATISTICAL METRICS COMPLIANCE
+# -----------------------------------------------------------------------------
 def calculate_metrics(y_true, y_pred, n_param):
     n = len(y_true)
     rss = np.sum((y_true - y_pred)**2)
     if n <= n_param + 1:
         return 0, float('inf'), float('inf')
+    
     ss_tot = np.sum((y_true - np.mean(y_true))**2)
     r2 = 1 - (rss / ss_tot) if ss_tot != 0 else 0
+    
     aic = n * np.log(rss / n) + 2 * n_param
     bic = n * np.log(rss / n) + n_param * np.log(n)
     return r2, aic, bic
 
+# -----------------------------------------------------------------------------
+# 3. INTERFACE AND RUNTIME
+# -----------------------------------------------------------------------------
 st.title("🔬 CaO Sorbent Calcium-Looping Kinetic Analyzer")
 st.markdown("Upload raw TGA parameters, drag/crop cycle regimes, parse capture capacity, and run dynamically optimized two-stage kinetic fits.")
 
@@ -93,6 +107,7 @@ uploaded_file = st.file_uploader("Upload TGA Run CSV Data", type=["csv"])
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
+    
     st.sidebar.header("Column Mapping")
     t_col = st.sidebar.selectbox("Time Column", df.columns, index=0 if "time" in df.columns.str.lower() else 0)
     w_col = st.sidebar.selectbox("Weight Column", df.columns, index=1 if "weight" in df.columns.str.lower() else 1)
@@ -101,15 +116,26 @@ if uploaded_file:
     df = df[[t_col, w_col, temp_col]].dropna().astype(float).sort_values(by=t_col).reset_index(drop=True)
     
     st.subheader("1. Full Profile & Cycle Bounding Range")
+    st.info("Use the Plotly interactive toolbar zoom/box-select to locate your cycle coordinates.")
+    
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df[t_col], y=df[w_col], name="Weight (mg)", yaxis="y1", line=dict(color="#1f77b4")))
     fig.add_trace(go.Scatter(x=df[t_col], y=df[temp_col], name="Temp (°C)", yaxis="y2", line=dict(color="#ff7f0e", dash="dash")))
     
     fig.update_layout(
-        xaxis=dict(title="Time (s)"),
-        yaxis=dict(title="Weight (mg)", titlefont=dict(color="#1f77b4"), tickfont=dict(color="#1f77b4")),
-        yaxis2=dict(title="Temperature (°C)", titlefont=dict(color="#ff7f0e"), tickfont=dict(color="#ff7f0e"), overlaying="y", side="right"),
-        height=450, margin=dict(l=20, r=20, t=20, b=20)
+        xaxis=dict(title=dict(text="Time (s or min)")),
+        yaxis=dict(
+            title=dict(text="Weight (mg / %)", font=dict(color="#1f77b4")), 
+            tickfont=dict(color="#1f77b4")
+        ),
+        yaxis2=dict(
+            title=dict(text="Temperature (°C)", font=dict(color="#ff7f0e")), 
+            tickfont=dict(color="#ff7f0e"), 
+            overlaying="y", 
+            side="right"
+        ),
+        height=450, 
+        margin=dict(l=20, r=20, t=20, b=20)
     )
     st.plotly_chart(fig, use_container_width=True)
     
@@ -123,8 +149,10 @@ if uploaded_file:
     
     if len(cycle_df) > 5:
         st.subheader("2. CO₂ Capture Performance Metrics")
+        
         w_initial = cycle_df[w_col].iloc[0]
         w_final = cycle_df[w_col].iloc[-1]
+        
         weight_gain = w_final - w_initial
         capacity = (weight_gain / w_initial) / 44.009 * 1000 if w_initial > 0 else 0
         
@@ -134,7 +162,11 @@ if uploaded_file:
         c3.metric("CO₂ Capture Capacity", f"{capacity:.3f} mmol CO₂/g")
         
         cycle_df['t_rel'] = cycle_df[t_col] - t_start
-        cycle_df['X'] = (cycle_df[w_col] - w_initial) / weight_gain if weight_gain != 0 else 0.0
+        if weight_gain != 0:
+            cycle_df['X'] = (cycle_df[w_col] - w_initial) / weight_gain
+        else:
+            cycle_df['X'] = 0.0
+            
         cycle_df['X'] = np.clip(cycle_df['X'], 0.0, 1.0)
         
         t_arr = cycle_df['t_rel'].values
@@ -144,44 +176,74 @@ if uploaded_file:
         fit_type = st.radio("Select Structuring Strategy", ["Single-Stage Continuous", "Two-Stage Optimized Split (Independent per Model)"])
         
         models_config = {
-            "First-Order": {"func": model_first_order, "p0": lambda s: [0.01], "bounds": lambda s: ([0.0], [np.inf]), "n_p": 1},
-            "Avrami": {"func": model_avrami, "p0": lambda s: [0.01, 1.0], "bounds": lambda s: ([0.0, 0.1], [np.inf, 5.0]), "n_p": 2},
-            "Shrinking-Core (SCM)": {"func": model_shrinking_core, "p0": lambda s: [0.005], "bounds": lambda s: ([0.0], [np.inf]), "n_p": 1},
-            "Random Pore (RPM)": {"func": model_random_pore, "p0": lambda s: [0.01, 2.0], "bounds": lambda s: ([0.0, 0.0], [np.inf, 50.0]), "n_p": 2},
-            "Double Exponential": {"func": model_double_exponential, "p0": lambda s: [0.05, 0.005, 0.6], "bounds": lambda s: ([0.0, 0.0, 0.0], [np.inf, np.inf, 1.0]), "n_p": 3},
-            "Grain Model": {"func": model_grain, "p0": lambda s: [0.005], "bounds": lambda s: ([0.0], [np.inf]), "n_p": 1},
-            "nth-Order": {"func": model_nth_order, "p0": lambda s: [0.01, 1.5], "bounds": lambda s: ([0.0, 0.0], [np.inf, 10.0]), "n_p": 2}
+            "First-Order": {
+                "func": model_first_order,
+                "p0": lambda stage: [0.01],
+                "bounds": lambda stage: ([0.0], [np.inf]),
+                "n_p": 1
+            },
+            "Avrami": {
+                "func": model_avrami,
+                "p0": lambda stage: [0.01, 1.0],
+                "bounds": lambda stage: ([0.0, 0.1], [np.inf, 5.0]),
+                "n_p": 2
+            },
+            "Shrinking-Core (SCM)": {
+                "func": model_shrinking_core,
+                "p0": lambda stage: [0.005],
+                "bounds": lambda stage: ([0.0], [np.inf]),
+                "n_p": 1
+            },
+            "Random Pore (RPM)": {
+                "func": model_random_pore,
+                "p0": lambda stage: [0.01, 2.0] if stage==1 else [0.002, 2.0],
+                "bounds": lambda stage: ([0.0, 0.0], [np.inf, 50.0]),
+                "n_p": 2
+            },
+            "Double Exponential": {
+                "func": model_double_exponential,
+                "p0": lambda stage: [0.05, 0.005, 0.6],
+                "bounds": lambda stage: ([0.0, 0.0, 0.0], [np.inf, np.inf, 1.0]),
+                "n_p": 3
+            },
+            "Grain Model": {
+                "func": model_grain,
+                "p0": lambda stage: [0.005],
+                "bounds": lambda stage: ([0.0], [np.inf]),
+                "n_p": 1
+            },
+            "nth-Order": {
+                "func": model_nth_order,
+                "p0": lambda stage: [0.01, 1.5],
+                "bounds": lambda stage: ([0.0, 0.0], [np.inf, 10.0]),
+                "n_p": 2
+            }
         }
         
-        results_summary, plot_traces = [], {}
+        results_summary = []
+        plot_traces = {}
+        
         for name, cfg in models_config.items():
             if fit_type == "Single-Stage Continuous":
                 try:
                     popt, _ = curve_fit(cfg["func"], t_arr, X_arr, p0=cfg["p0"](1), bounds=cfg["bounds"](1), maxfev=3000)
                     y_pred = cfg["func"](t_arr, *popt)
                     r2, aic, bic = calculate_metrics(X_arr, y_pred, cfg["n_p"])
-                    results_summary.append({"Model": name, "Fit Strategy": "Single-Stage", "R²": round(r2, 4), "AIC": round(aic, 2), "BIC": round(bic, 2), "Transition Point (t_tr)": "N/A", "Transition Conv (X_tr)": "N/A"})
+                    
+                    results_summary.append({
+                        "Model": name, "Fit Strategy": "Single-Stage", 
+                        "R²": round(r2, 4), "AIC": round(aic, 2), "BIC": round(bic, 2),
+                        "Transition Point (t_tr)": "N/A", "Transition Conv (X_tr)": "N/A"
+                    })
                     plot_traces[name] = y_pred
-                except: continue
+                except:
+                    continue
             else:
                 fit_res = evaluate_two_stage(t_arr, X_arr, cfg["func"], cfg["bounds"], cfg["p0"])
                 if fit_res is not None:
                     r2, aic, bic = calculate_metrics(X_arr, fit_res['y_pred'], cfg["n_p"] * 2)
-                    results_summary.append({"Model": name, "Fit Strategy": "Two-Stage Split", "R²": round(r2, 4), "AIC": round(aic, 2), "BIC": round(bic, 2), "Transition Point (t_tr)": f"{fit_res['t_tr']:.2f} s", "Transition Conv (X_tr)": f"{fit_res['X_tr']:.3f}"})
-                    plot_traces[name] = fit_res['y_pred']
                     
-        res_df = pd.DataFrame(results_summary)
-        if not res_df.empty:
-            st.dataframe(res_df.sort_values(by="BIC"), use_container_width=True)
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                res_df.to_excel(writer, index=False, sheet_name='Kinetic_Metrics')
-            st.download_button(label="📥 Export Report Table (.xlsx)", data=output.getvalue(), file_name="Kinetic_Modeling_Report.xlsx")
-            
-            st.subheader("4. Kinetic Alignment Comparison Plot")
-            fig_fit = go.Figure()
-            fig_fit.add_trace(go.Scatter(x=t_arr, y=X_arr, mode='markers', name='Experimental Data', marker=dict(color='black', size=4)))
-            for m_name, pred_vector in plot_traces.items():
-                fig_fit.add_trace(go.Scatter(x=t_arr, y=pred_vector, mode='lines', name=f'{m_name} Fit'))
-            fig_fit.update_layout(xaxis=dict(title="Relative Time (s)"), yaxis=dict(title="Conversion (X)"), template="plotly_white", height=550)
-            st.plotly_chart(fig_fit, use_container_width=True)
+                    results_summary.append({
+                        "Model": name, "Fit Strategy": "Two-Stage Split", 
+                        "R²": round(r2, 4), "AIC": round(aic, 2), "BIC": round(bic, 2),
+                        "Transition Point (t_tr)": f"{fit_res['t_tr']:.2f} s", 
