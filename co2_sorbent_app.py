@@ -312,19 +312,6 @@ def _pack_stage_fit(params, X_arr, X_pred, count_keys):
     return {"params": params, "r2": r2, "sse": sse, "aic": aic, "bic": bic, "n": n_pts, "k_params": k_params}
 
 
-def fit_stage1_fast(t_arr, X_arr):
-    """Fast, reaction-controlled stage. Forced through the true origin (t=0, X=0),
-    since this stage starts at the actual reaction onset."""
-    r = linreg(t_arr, -np.log(1 - X_arr))
-    if r is None:
-        return None
-    params = {"k": r["slope"]}
-    X_pred = 1 - np.exp(-params["k"] * t_arr)
-    fit = _pack_stage_fit(params, X_arr, X_pred, ["k"])
-    fit["invert"] = lambda t: 1 - np.exp(-params["k"] * t)
-    return fit
-
-
 def fit_stage2_diffusion(t_arr, X_arr):
     """Slow, diffusion-controlled stage. This segment does NOT start at X=0 (it picks
     up mid-curve, at the transition conversion), so it needs its own local intercept
@@ -347,32 +334,106 @@ def fit_stage2_diffusion(t_arr, X_arr):
     return fit
 
 
-def find_best_split(t_arr, X_arr, fast_model="Pseudo first-order", lo=0.15, hi=0.95, step=0.02, min_frac=0.15):
-    """Search candidate transition points and keep the one minimizing total SSE across
-    both stages, for a given choice of fast-stage model (diffusion stage is fixed).
-    Since the point count and parameter count don't change with the split location for
-    a fixed model pair, minimizing total SSE here is equivalent to minimizing total AIC/BIC.
+def _achievable_bounds(X_arr, min_frac=0.1):
+    """Rank-based (not value-percentile-based) bounds guaranteeing at least min_frac of the
+    cycle's points fall strictly on EACH side of any tx chosen within [lo, hi]. A raw value
+    percentile can fail when many points are tied near a plateau (common near the end of a
+    carbonation curve) -- np.percentile can return exactly the tied value, and then 'X > tx'
+    matches zero points. Working from sorted ranks instead makes this immune to ties."""
+    X_sorted = np.sort(np.asarray(X_arr))
+    n = len(X_sorted)
+    min_pts = max(3, int(np.ceil(min_frac * n)))
+    if n - min_pts <= min_pts:
+        return None
+    lo = float(X_sorted[min_pts - 1])
+    eps = max((X_sorted[-1] - X_sorted[0]) * 1e-6, 1e-9)
+    hi = float(X_sorted[n - min_pts]) - eps
+    if hi <= lo:
+        return None
+    return lo, hi
 
-    min_frac requires each stage to contain at least this fraction of the cycle's points,
-    so a flexible model (DEM, nth-order) can't just swallow almost the entire curve as
-    'fast stage' and call a token tail 'diffusion' -- that trivially wins on SSE/AIC
-    without describing a real two-regime mechanism."""
+
+def detect_transition(t_arr, X_arr, rate_frac=0.15, smooth_window=5, min_frac=0.1):
+    """Data-driven, model-independent transition detection, following standard practice in
+    the CaO carbonation literature (e.g. Grasa et al.'s 'X_k-D'): the kinetic-to-diffusion
+    transition is identified directly from the reaction-rate curve itself -- where the rate
+    drops to a small fraction of its peak value -- NOT by re-fitting and re-optimizing a
+    split separately for every candidate model. It's a property of the data, and every model
+    is then evaluated against that same split, which is what makes the comparison fair.
+
+    The result is clipped to what THIS cycle's own data can support (see _achievable_bounds)
+    -- a cycle that only reaches, say, 60% conversion can't have its transition land at 75%,
+    which is what used to cause 'not enough points on one side'."""
+    order = np.argsort(t_arr)
+    t_s, X_s = np.asarray(t_arr)[order], np.asarray(X_arr)[order]
+    if len(t_s) < 6:
+        return None
+    bounds = _achievable_bounds(X_s, min_frac)
+    if bounds is None:
+        return None
+    lo, hi = bounds
+    rate = np.gradient(X_s, t_s)
+    w = min(smooth_window, len(rate) if len(rate) % 2 == 1 else len(rate) - 1)
+    if w >= 3:
+        kernel = np.ones(w) / w
+        rate = np.convolve(rate, kernel, mode="same")
+    search_end = max(3, len(rate) // 3)
+    peak_idx = int(np.argmax(rate[:search_end]))
+    peak_rate = rate[peak_idx]
+    if peak_rate <= 0:
+        return None
+    threshold = rate_frac * peak_rate
+    below = np.where(rate[peak_idx:] <= threshold)[0]
+    if len(below) == 0:
+        return None
+    idx = peak_idx + below[0]
+    tx = float(X_s[idx])
+    return min(max(tx, lo), hi)
+
+
+def clip_to_achievable(X_arr, tx, min_frac=0.1):
+    """Clip a (possibly manually-entered) transition point to what this cycle's data can
+    actually support, the same way detect_transition does -- returns (clipped_tx, was_adjusted)."""
+    bounds = _achievable_bounds(X_arr, min_frac)
+    if bounds is None:
+        return tx, False
+    lo, hi = bounds
+    clipped = min(max(tx, lo), hi)
+    return clipped, abs(clipped - tx) > 1e-9
+
+
+def fit_two_stage(t_arr, X_arr, fast_model, tx, min_frac=0.1):
+    """Fit both stages at a given, already-chosen transition point tx (shared across every
+    model being compared -- see detect_transition)."""
     n_total = len(X_arr)
     min_pts = max(3, int(np.ceil(min_frac * n_total)))
+    mask1, mask2 = X_arr <= tx, X_arr > tx
+    if mask1.sum() < min_pts or mask2.sum() < min_pts:
+        return None
+    f1 = fit_model(fast_model, t_arr[mask1], X_arr[mask1])
+    f2 = fit_stage2_diffusion(t_arr[mask2], X_arr[mask2])
+    if f1 is None or f2 is None:
+        return None
+    return {"tx": tx, "f1": f1, "f2": f2}
+
+
+def find_best_split_per_model(t_arr, X_arr, fast_model, n_steps=40, min_frac=0.1):
+    """Search for the transition point that minimizes total SSE for THIS specific
+    fast-stage model (each model gets its own best split, independent of the others).
+    Candidates are restricted to _achievable_bounds so a tied/plateau-heavy curve can't
+    produce an empty segment the way a raw value-percentile search could."""
+    bounds = _achievable_bounds(X_arr, min_frac)
+    if bounds is None:
+        return None
+    lo, hi = bounds
     best = None
-    for tx in np.arange(lo, hi + 1e-9, step):
-        mask1, mask2 = X_arr <= tx, X_arr > tx
-        if mask1.sum() < min_pts or mask2.sum() < min_pts:
+    for tx in np.linspace(lo, hi, n_steps):
+        fit2 = fit_two_stage(t_arr, X_arr, fast_model, tx, min_frac)
+        if fit2 is None:
             continue
-        f1 = fit_model(fast_model, t_arr[mask1], X_arr[mask1])
-        f2 = fit_stage2_diffusion(t_arr[mask2], X_arr[mask2])
-        if f1 is None or f2 is None:
-            continue
-        total_sse = f1["sse"] + f2["sse"]
+        total_sse = fit2["f1"]["sse"] + fit2["f2"]["sse"]
         if best is None or total_sse < best["total_sse"]:
-            best = {"tx": round(float(tx), 3), "f1": f1, "f2": f2, "total_sse": total_sse}
-    if best is not None:
-        best["near_bound"] = best["tx"] <= lo + step or best["tx"] >= hi - step
+            best = {"tx": tx, "f1": fit2["f1"], "f2": fit2["f2"], "total_sse": total_sse}
     return best
 
 
@@ -711,25 +772,26 @@ for _, row in valid.iterrows():
                     st.warning("Couldn't fit this model to this cycle \u2014 try a simpler model or a wider selection.")
         else:
             # ---------------- two-stage fit: 'model' column picks the fast-stage sub-model ----------------
-            auto_split = st.checkbox("Auto-find best split (minimize total SSE)", key=f"autosplit_{row.name}_{row['label']}", value=True)
+            # Each model gets its own independently-optimized transition point (minimizing
+            # that model's own total SSE), so different models will show different splits.
+            auto_split = st.checkbox("Auto-find best split per model (minimize SSE)", key=f"autosplit_{row.name}_{row['label']}", value=True)
 
             if compare_mode:
-                palette = ["#2F6F5E", "#B5482F", "#4A6FA5", "#B08A2E", "#7A4E9E", "#3C8C8C", "#8E6C3A", "#6B7B4F"]
                 rows_cmp = []
-                for i, name in enumerate(MODEL_NAMES):
+                for name in MODEL_NAMES:
                     if auto_split:
-                        best_i = find_best_split(t_arr, X_arr, fast_model=name)
-                        tx_i, f1i, f2i = (best_i["tx"], best_i["f1"], best_i["f2"]) if best_i else (row["transition_X"], None, None)
+                        best = find_best_split_per_model(t_arr, X_arr, name)
+                        tx_i = best["tx"] if best else clip_to_achievable(X_arr, row["transition_X"])[0]
+                        fit2 = {"f1": best["f1"], "f2": best["f2"]} if best else None
                     else:
-                        tx_i = row["transition_X"]
-                        m1, m2 = X_arr <= tx_i, X_arr > tx_i
-                        f1i = fit_model(name, t_arr[m1], X_arr[m1]) if m1.sum() >= 3 else None
-                        f2i = fit_stage2_diffusion(t_arr[m2], X_arr[m2]) if m2.sum() >= 3 else None
-                    if f1i is None or f2i is None:
+                        tx_i, _ = clip_to_achievable(X_arr, row["transition_X"])
+                        fit2 = fit_two_stage(t_arr, X_arr, name, tx_i)
+                    if fit2 is None:
                         rows_cmp.append({"Fast-stage model": name, "Transition X": f"{tx_i:.2f}", "Fast params": "\u2014",
                                           "R\u00b2 fast": "\u2014", "k\u2082 diff": "\u2014", "R\u00b2 diff": "\u2014",
                                           "Total SSE": None, "Total AIC": None, "Total BIC": None})
                         continue
+                    f1i, f2i = fit2["f1"], fit2["f2"]
                     tot = total_stats(f1i, f2i)
                     rows_cmp.append({"Fast-stage model": name, "Transition X": f"{tx_i:.2f}",
                                       "Fast params": params_str(f1i["params"]), "R\u00b2 fast": f"{f1i['r2']:.4f}",
@@ -747,24 +809,22 @@ for _, row in valid.iterrows():
                                f"(Total AIC = {best_row['Total AIC']:.2f}).")
             else:
                 if auto_split:
-                    best = find_best_split(t_arr, X_arr, fast_model=fast_model)
+                    best = find_best_split_per_model(t_arr, X_arr, fast_model)
                     if best is None:
-                        st.warning("Couldn't find a valid split point with enough points on both sides \u2014 falling back to the manual Transition X.")
-                        tx = row["transition_X"]
-                        mask1, mask2 = X_arr <= tx, X_arr > tx
-                        f1 = fit_model(fast_model, t_arr[mask1], X_arr[mask1]) if mask1.sum() >= 3 else None
-                        f2 = fit_stage2_diffusion(t_arr[mask2], X_arr[mask2]) if mask2.sum() >= 3 else None
+                        st.warning("Couldn't find a valid split for this model \u2014 falling back to the manual Transition X.")
+                        tx, _ = clip_to_achievable(X_arr, row["transition_X"])
+                        fit2 = fit_two_stage(t_arr, X_arr, fast_model, tx)
                     else:
-                        tx, f1, f2 = best["tx"], best["f1"], best["f2"]
-                        st.caption(f"Auto-detected transition at X = {tx:.2f} (fast stage = {fast_model}, lowest combined SSE).")
+                        tx = best["tx"]
+                        fit2 = {"f1": best["f1"], "f2": best["f2"]}
+                        st.caption(f"Best split for {fast_model}: X = {tx:.2f} (minimizes this model's own total SSE).")
                 else:
-                    tx = row["transition_X"]
-                    mask1, mask2 = X_arr <= tx, X_arr > tx
-                    f1 = fit_model(fast_model, t_arr[mask1], X_arr[mask1]) if mask1.sum() >= 3 else None
-                    f2 = fit_stage2_diffusion(t_arr[mask2], X_arr[mask2]) if mask2.sum() >= 3 else None
+                    tx, _ = clip_to_achievable(X_arr, row["transition_X"])
+                    fit2 = fit_two_stage(t_arr, X_arr, fast_model, tx)
+                f1, f2 = (fit2["f1"], fit2["f2"]) if fit2 else (None, None)
 
                 if f1 and f2:
-                    mask1, mask2 = X_arr <= tx, X_arr > tx
+                    mask2 = X_arr > tx
                     t_split = t_arr[mask2].min()
                     c1, c2 = t_curve[t_curve <= t_split], t_curve[t_curve > t_split]
                     d_fast = MODEL_DEFS[fast_model]
@@ -921,22 +981,20 @@ for _, row in valid.iterrows():
         fast_model = row["model"]
         auto_split = st.session_state.get(f"autosplit_{row.name}_{row['label']}", True)
         if auto_split:
-            best = find_best_split(t_arr, X_arr, fast_model=fast_model)
-            tx = best["tx"] if best else row["transition_X"]
+            best = find_best_split_per_model(t_arr, X_arr, fast_model)
+            tx = best["tx"] if best else clip_to_achievable(X_arr, row["transition_X"])[0]
+            fit2 = {"f1": best["f1"], "f2": best["f2"]} if best else None
         else:
-            tx = row["transition_X"]
-        mask1, mask2 = X_arr <= tx, X_arr > tx
+            tx = clip_to_achievable(X_arr, row["transition_X"])[0]
+            fit2 = fit_two_stage(t_arr, X_arr, fast_model, tx)
         rec = {"Cycle": row["label"], "Model": f"Two-stage ({fast_model} + diffusion)", "Temperature": row.get("temperature"), "Transition X": tx}
-        if mask1.sum() >= 3 and mask2.sum() >= 3:
-            f1 = fit_model(fast_model, t_arr[mask1], X_arr[mask1])
-            f2 = fit_stage2_diffusion(t_arr[mask2], X_arr[mask2])
-            if f1:
-                for k, v in f1["params"].items():
-                    if not k.startswith("_"):
-                        rec[f"fast_{PARAM_LABELS.get(k, k)}"] = v
-                rec.update({"R2_fast": f1["r2"], "AIC_fast": f1["aic"], "BIC_fast": f1["bic"], "SSE_fast": f1["sse"]})
-            if f2:
-                rec.update({"k2": f2["params"]["k"], "c2": f2["params"]["c"], "R2_diff": f2["r2"], "AIC_diff": f2["aic"], "BIC_diff": f2["bic"], "SSE_diff": f2["sse"]})
+        if fit2:
+            f1, f2 = fit2["f1"], fit2["f2"]
+            for k, v in f1["params"].items():
+                if not k.startswith("_"):
+                    rec[f"fast_{PARAM_LABELS.get(k, k)}"] = v
+            rec.update({"R2_fast": f1["r2"], "AIC_fast": f1["aic"], "BIC_fast": f1["bic"], "SSE_fast": f1["sse"]})
+            rec.update({"k2": f2["params"]["k"], "c2": f2["params"]["c"], "R2_diff": f2["r2"], "AIC_diff": f2["aic"], "BIC_diff": f2["bic"], "SSE_diff": f2["sse"]})
         summary_rows.append(rec)
 
 summary_df = pd.DataFrame(summary_rows)
@@ -1023,25 +1081,20 @@ if final_prep is None:
     st.warning("Not enough data in this cycle.")
 elif comparison_type == "Two-stage (fast + diffusion)":
     st.caption(
-        "Tries every model as the fast/reaction-controlled stage (paired with the standard product-layer "
-        "diffusion equation for the slow stage) and reports every fitted number for each pairing. The transition "
-        "point is auto-optimized per model (minimizing total SSE across both stages, with each stage required to "
-        "hold at least 15% of the cycle's points, so a flexible model can't just swallow the whole curve and call "
-        "a token tail 'diffusion'). The best-fitting row (lowest total AIC) is highlighted. A 'near search bound' "
-        "note means that model's optimal split landed at the edge of the search range \u2014 treat that row cautiously, "
-        "since the model wants an even more extreme split than it was allowed."
+        "Each model gets its own independently-optimized transition point, minimizing that model's own "
+        "total SSE across both stages. The best-fitting row (lowest total AIC) is highlighted."
     )
     kept = final_prep["kept"]
     t_arrF, X_arrF = kept["t_fit"].values, kept["X"].values
     final_rows = []
     for name in MODEL_NAMES:
-        best = find_best_split(t_arrF, X_arrF, fast_model=name)
+        best = find_best_split_per_model(t_arrF, X_arrF, name)
         if best is None:
             final_rows.append({
                 "Fast-stage model": name, "Transition X": None, "Fast params": "fit failed",
                 "R2 fast": None, "SSE fast": None, "AIC fast": None, "BIC fast": None,
                 "Diffusion params": "\u2014", "R2 diff": None, "SSE diff": None, "AIC diff": None, "BIC diff": None,
-                "Total SSE": None, "Total AIC": None, "Total BIC": None, "Note": "\u2014",
+                "Total SSE": None, "Total AIC": None, "Total BIC": None,
             })
             continue
         f1, f2 = best["f1"], best["f2"]
@@ -1052,35 +1105,33 @@ elif comparison_type == "Two-stage (fast + diffusion)":
             "Diffusion params": params_str(f2["params"]), "R2 diff": f2["r2"], "SSE diff": f2["sse"],
             "AIC diff": f2["aic"], "BIC diff": f2["bic"],
             "Total SSE": tot["sse"], "Total AIC": tot["aic"], "Total BIC": tot["bic"],
-            "Note": "\u26a0 near search bound" if best.get("near_bound") else "",
         })
-
     final_df = pd.DataFrame(final_rows).sort_values("Total AIC", na_position="last").reset_index(drop=True)
 
-    numeric_cols = ["Transition X", "R2 fast", "SSE fast", "AIC fast", "BIC fast",
-                     "R2 diff", "SSE diff", "AIC diff", "BIC diff", "Total SSE", "Total AIC", "Total BIC"]
+    if not final_df.empty:
+        numeric_cols = ["Transition X", "R2 fast", "SSE fast", "AIC fast", "BIC fast",
+                         "R2 diff", "SSE diff", "AIC diff", "BIC diff", "Total SSE", "Total AIC", "Total BIC"]
 
-    def _highlight_best(row_):
-        is_best = row_.name == final_df["Total AIC"].idxmin() if final_df["Total AIC"].notna().any() else False
-        return ["background-color: #DCE9E4" if is_best else "" for _ in row_]
+        def _highlight_best(row_):
+            is_best = row_.name == final_df["Total AIC"].idxmin() if final_df["Total AIC"].notna().any() else False
+            return ["background-color: #DCE9E4" if is_best else "" for _ in row_]
 
-    styled = (
-        final_df.style
-        .apply(_highlight_best, axis=1)
-        .format({c: "{:.4g}" for c in numeric_cols}, na_rep="\u2014")
-    )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
-
-    if final_df["Total AIC"].notna().any():
-        best_row = final_df.loc[final_df["Total AIC"].idxmin()]
-        note = " (\u26a0 landed near the search bound \u2014 interpret cautiously)" if best_row["Note"] else ""
-        st.caption(
-            f"**Best overall: {best_row['Fast-stage model']}** as the fast stage "
-            f"(Transition X = {best_row['Transition X']:.2f}, Total AIC = {best_row['Total AIC']:.2f}, "
-            f"Total SSE = {best_row['Total SSE']:.4g}){note}."
+        styled = (
+            final_df.style
+            .apply(_highlight_best, axis=1)
+            .format({c: "{:.4g}" for c in numeric_cols}, na_rep="\u2014")
         )
+        st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    df_download_buttons(final_df, f"two_stage_comparison_{final_cycle}", "final_cmp")
+        if final_df["Total AIC"].notna().any():
+            best_row = final_df.loc[final_df["Total AIC"].idxmin()]
+            st.caption(
+                f"**Best overall: {best_row['Fast-stage model']}** as the fast stage "
+                f"(Transition X = {best_row['Transition X']:.2f}, Total AIC = {best_row['Total AIC']:.2f}, "
+                f"Total SSE = {best_row['Total SSE']:.4g})."
+            )
+
+        df_download_buttons(final_df, f"two_stage_comparison_{final_cycle}", "final_cmp")
 
 else:
     st.caption(
