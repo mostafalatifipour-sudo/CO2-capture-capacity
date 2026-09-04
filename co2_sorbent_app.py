@@ -101,11 +101,11 @@ def diffusion_inv_scalar(y):
 
 def fit_pfo(t, X):
     r = linreg(t, -np.log(1 - X))
-    return None if r is None else {"k": r["slope"]}
+    return None if r is None else {"k": r["slope"], "c": r["intercept"]}
 
 
 def invert_pfo(p, t):
-    return 1 - np.exp(-p["k"] * t)
+    return 1 - np.exp(-(p["k"] * t + p.get("c", 0.0)))
 
 
 def fit_avrami(t, X):
@@ -119,21 +119,21 @@ def invert_avrami(p, t):
 
 def fit_scm_r(t, X):
     r = linreg(t, 1 - (1 - X) ** (1 / 3))
-    return None if r is None else {"k": r["slope"]}
+    return None if r is None else {"k": r["slope"], "c": r["intercept"]}
 
 
 def invert_scm_r(p, t):
-    y = min(p["k"] * t, 1)
+    y = min(p["k"] * t + p.get("c", 0.0), 1)
     return 1 - (1 - y) ** 3
 
 
 def fit_scm_d(t, X):
     r = linreg(t, diffusion_f(X))
-    return None if r is None else {"k": r["slope"]}
+    return None if r is None else {"k": r["slope"], "c": r["intercept"]}
 
 
 def invert_scm_d(p, t):
-    return diffusion_inv_scalar(p["k"] * t)
+    return diffusion_inv_scalar(p["k"] * t + p.get("c", 0.0))
 
 
 # ---------------------------------------------------------------- model 5: Random Pore Model
@@ -310,19 +310,6 @@ def _pack_stage_fit(params, X_arr, X_pred, count_keys):
     aic = n_pts * np.log(sse_safe / n_pts) + 2 * k_params
     bic = n_pts * np.log(sse_safe / n_pts) + k_params * np.log(n_pts)
     return {"params": params, "r2": r2, "sse": sse, "aic": aic, "bic": bic, "n": n_pts, "k_params": k_params}
-
-
-def fit_stage1_fast(t_arr, X_arr):
-    """Fast, reaction-controlled stage. Forced through the true origin (t=0, X=0),
-    since this stage starts at the actual reaction onset."""
-    r = linreg(t_arr, -np.log(1 - X_arr))
-    if r is None:
-        return None
-    params = {"k": r["slope"]}
-    X_pred = 1 - np.exp(-params["k"] * t_arr)
-    fit = _pack_stage_fit(params, X_arr, X_pred, ["k"])
-    fit["invert"] = lambda t: 1 - np.exp(-params["k"] * t)
-    return fit
 
 
 def fit_stage2_diffusion(t_arr, X_arr):
