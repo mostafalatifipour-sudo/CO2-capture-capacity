@@ -334,17 +334,44 @@ def fit_stage2_diffusion(t_arr, X_arr):
     return fit
 
 
-def detect_transition(t_arr, X_arr, rate_frac=0.15, smooth_window=5, min_x=0.15, max_x=0.95):
+def _achievable_bounds(X_arr, min_frac=0.1):
+    """Rank-based (not value-percentile-based) bounds guaranteeing at least min_frac of the
+    cycle's points fall strictly on EACH side of any tx chosen within [lo, hi]. A raw value
+    percentile can fail when many points are tied near a plateau (common near the end of a
+    carbonation curve) -- np.percentile can return exactly the tied value, and then 'X > tx'
+    matches zero points. Working from sorted ranks instead makes this immune to ties."""
+    X_sorted = np.sort(np.asarray(X_arr))
+    n = len(X_sorted)
+    min_pts = max(3, int(np.ceil(min_frac * n)))
+    if n - min_pts <= min_pts:
+        return None
+    lo = float(X_sorted[min_pts - 1])
+    eps = max((X_sorted[-1] - X_sorted[0]) * 1e-6, 1e-9)
+    hi = float(X_sorted[n - min_pts]) - eps
+    if hi <= lo:
+        return None
+    return lo, hi
+
+
+def detect_transition(t_arr, X_arr, rate_frac=0.15, smooth_window=5, min_frac=0.1):
     """Data-driven, model-independent transition detection, following standard practice in
     the CaO carbonation literature (e.g. Grasa et al.'s 'X_k-D'): the kinetic-to-diffusion
     transition is identified directly from the reaction-rate curve itself -- where the rate
     drops to a small fraction of its peak value -- NOT by re-fitting and re-optimizing a
     split separately for every candidate model. It's a property of the data, and every model
-    is then evaluated against that same split, which is what makes the comparison fair."""
+    is then evaluated against that same split, which is what makes the comparison fair.
+
+    The result is clipped to what THIS cycle's own data can support (see _achievable_bounds)
+    -- a cycle that only reaches, say, 60% conversion can't have its transition land at 75%,
+    which is what used to cause 'not enough points on one side'."""
     order = np.argsort(t_arr)
     t_s, X_s = np.asarray(t_arr)[order], np.asarray(X_arr)[order]
     if len(t_s) < 6:
         return None
+    bounds = _achievable_bounds(X_s, min_frac)
+    if bounds is None:
+        return None
+    lo, hi = bounds
     rate = np.gradient(X_s, t_s)
     w = min(smooth_window, len(rate) if len(rate) % 2 == 1 else len(rate) - 1)
     if w >= 3:
@@ -361,7 +388,18 @@ def detect_transition(t_arr, X_arr, rate_frac=0.15, smooth_window=5, min_x=0.15,
         return None
     idx = peak_idx + below[0]
     tx = float(X_s[idx])
-    return round(min(max(tx, min_x), max_x), 3)
+    return min(max(tx, lo), hi)
+
+
+def clip_to_achievable(X_arr, tx, min_frac=0.1):
+    """Clip a (possibly manually-entered) transition point to what this cycle's data can
+    actually support, the same way detect_transition does -- returns (clipped_tx, was_adjusted)."""
+    bounds = _achievable_bounds(X_arr, min_frac)
+    if bounds is None:
+        return tx, False
+    lo, hi = bounds
+    clipped = min(max(tx, lo), hi)
+    return clipped, abs(clipped - tx) > 1e-9
 
 
 def fit_two_stage(t_arr, X_arr, fast_model, tx, min_frac=0.1):
@@ -722,12 +760,15 @@ for _, row in valid.iterrows():
                 tx_detected = detect_transition(t_arr, X_arr)
                 if tx_detected is None:
                     st.warning("Couldn't detect a clear transition from the rate curve \u2014 falling back to the manual Transition X.")
-                    tx = row["transition_X"]
+                    tx, adjusted = clip_to_achievable(X_arr, row["transition_X"])
                 else:
-                    tx = tx_detected
+                    tx, adjusted = tx_detected, False
                     st.caption(f"Detected transition at X = {tx:.2f} (from the rate curve, shared by every model below).")
             else:
-                tx = row["transition_X"]
+                tx, adjusted = clip_to_achievable(X_arr, row["transition_X"])
+            if adjusted:
+                st.caption(f"Note: this cycle's data only spans up to X\u2248{X_arr.max():.2f}, so the transition was "
+                           f"adjusted to X = {tx:.2f} to leave enough points on both sides.")
 
             if compare_mode:
                 rows_cmp = []
@@ -920,9 +961,9 @@ for _, row in valid.iterrows():
         auto_split = st.session_state.get(f"autosplit_{row.name}_{row['label']}", True)
         if auto_split:
             tx_detected = detect_transition(t_arr, X_arr)
-            tx = tx_detected if tx_detected is not None else row["transition_X"]
+            tx = tx_detected if tx_detected is not None else clip_to_achievable(X_arr, row["transition_X"])[0]
         else:
-            tx = row["transition_X"]
+            tx = clip_to_achievable(X_arr, row["transition_X"])[0]
         rec = {"Cycle": row["label"], "Model": f"Two-stage ({fast_model} + diffusion)", "Temperature": row.get("temperature"), "Transition X": tx}
         fit2 = fit_two_stage(t_arr, X_arr, fast_model, tx)
         if fit2:
